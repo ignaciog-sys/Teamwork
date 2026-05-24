@@ -1,0 +1,189 @@
+version: '3.8'
+
+services:
+  # ═════════════════════════════════════════════════════════════
+  #                    PostgreSQL (Warehouse)
+  # ═════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: warehouse_postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-datanalyst}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_123}
+      POSTGRES_DB: ${DB_NAME:-warehouse}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=es_ES.UTF-8"
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    ports:
+      - "5432:5432"
+    
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d
+          
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-datanalyst}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    networks:
+      - analytics_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"
+
+  # ═════════════════════════════════════════════════════════════
+  #                    pgAdmin (GUI para PostgreSQL)
+  # ═════════════════════════════════════════════════════════════
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_PROXY_X_FOR_COUNT: 1
+      PGADMIN_CONFIG_PROXY_X_PROTO_COUNT: 1
+      PGADMIN_CONFIG_PROXY_X_HOST_COUNT: 1
+    
+    ports:
+      - "5050:80"
+    
+    depends_on:
+      - postgres
+    
+    networks:
+      - analytics_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+
+  # ═════════════════════════════════════════════════════════════
+  #                    Redis (Cache)
+  # ═════════════════════════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: analytics_redis
+    ports:
+      - "6379:6379"
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    networks:
+      - analytics_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+
+# ═════════════════════════════════════════════════════════════
+  #                    Apache Superset (OLAP)
+  # ═════════════════════════════════════════════════════════════
+  superset:
+    image: apache/superset:latest
+    container_name: superset_app
+    
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-change-me}
+      SUPERSET_LOAD_EXAMPLES: "no"
+      FLASK_ENV: production
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    
+    ports:
+      - "8088:8088"
+    
+    depends_on:
+      - postgres
+      - redis
+    
+    volumes:
+      - ./dashboards:/app/dashboards
+      - superset_config:/app/superset_config
+    
+    # Inicializar Superset usando un bloque limpio (|)
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        (superset fab create-admin \
+          --username ${SUPERSET_USERNAME:-admin} \
+          --firstname Admin \
+          --lastname User \
+          --email admin@example.com \
+          --password ${SUPERSET_PASSWORD:-admin123} || true)
+        superset db upgrade
+        superset init
+        gunicorn -b 0.0.0.0:8088 --timeout 120 --workers 4 'superset.app:create_app()'
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    
+    networks:
+      - analytics_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+
+  # ═════════════════════════════════════════════════════════════
+  #                    ETL App (Python)
+  # ═════════════════════════════════════════════════════════════
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    
+    container_name: etl_app
+    
+    environment:
+      PYTHONUNBUFFERED: 1
+      DB_CONNECTION_STRING: postgresql://${DB_USER:-datanalyst}:${DB_PASSWORD:-secure_password_123}@postgres:5432/${DB_NAME:-warehouse}
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    volumes:
+      - .:/workspace
+      - ./data:/workspace/data
+      - ./logs:/workspace/logs
+    
+    working_dir: /workspace
+    
+    command: tail -f /dev/null  # Mantener contenedor corriendo
+    
+    networks:
+      - analytics_network
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+
+volumes:
+  postgres_data:
+    driver: local
+  superset_config:
+    driver: local
+
+networks:
+  analytics_network:
+    driver: bridge
